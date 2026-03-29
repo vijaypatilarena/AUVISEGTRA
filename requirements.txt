@@ -1,0 +1,25 @@
+streamlit
+opencv-python
+ultralytics
+scenedetect
+pyannote.audio
+librosa
+yt-dlp
+groq
+torch
+torchvision
+torchaudio
+pandas
+numpy
+plotly
+matplotlib
+scikit-learn
+insightface
+mediapipe
+moviepy
+requests
+python-dotenv
+tqdm
+torchreid
+# fame-reid # or fast-reid if available via pip
+# Note: some packages might require specific versions or manual installations
