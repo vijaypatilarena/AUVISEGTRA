@@ -25,7 +25,18 @@ def render_tracking_tab(alpha, beta):
     # Initialize components
     tracker = Tracker()
     reid = PersonReID()
-    audio_proc = AudioProcessor()
+    
+    # ── Sidebar Configuration Extension ──
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("🔑 Authentication")
+        hf_token = st.text_input(
+            "Hugging Face Token",
+            type="password",
+            help="Required for Pyannote Speaker Diarization (pyannote/speaker-diarization@2.1)"
+        )
+    
+    audio_proc = AudioProcessor(hf_token=hf_token if hf_token else None)
     fusion = FusionEngine(alpha, beta)
 
     if 'tracking_results' not in st.session_state:
@@ -75,17 +86,73 @@ def render_tracking_tab(alpha, beta):
 
                 # Step 3: Audio Diarization
                 st.write("🎙️ Extracting and diarizing audio...")
-                audio_path = os.path.join(tempfile.gettempdir(), "temp_audio.wav")
+                audio_path = os.path.join(tempfile.gettempdir(), f"audio_{os.path.basename(video_path)}.wav")
                 audio_proc.extract_audio(video_path, audio_path)
                 speaker_segments = audio_proc.diarize_audio(audio_path)
+                if not hf_token:
+                    st.info("💡 Note: Using mock diarization (HF Token missing).")
 
-                # Step 4: Multimodal Fusion & ReID
-                st.write("🔗 Performing Multimodal Fusion (Face + Voice)...")
+                # Step 4: Visual Tracking & ReID
+                st.write("🕺 Detecting and identifying characters (Literal YOLO + ReID)...")
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                person_appearances = []
+                
+                # Limit to 5 scenes for performance in demo, or process all if short
+                scenes_to_process = scenes[:10] 
+                
+                progress_bar = st.progress(0, text="Analyzing scenes...")
+                for i, scene in enumerate(scenes_to_process):
+                    start_frame = scene[0].get_frames()
+                    end_frame = scene[1].get_frames()
+                    
+                    # Sample 1 frame from the middle of the scene for ReID
+                    middle_frame_idx = (start_frame + end_frame) // 2
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_idx)
+                    ret, frame = cap.read()
+                    
+                    if ret:
+                        # Detect persons
+                        results = tracker.model(frame, classes=[0], verbose=False)
+                        boxes = results[0].boxes.xyxy.cpu().numpy()
+                        
+                        for j, box in enumerate(boxes):
+                            # Extract crop
+                            x1, y1, x2, y2 = map(int, box)
+                            crop = frame[y1:y2, x1:x2]
+                            if crop.size > 0:
+                                crop_path = os.path.join(tempfile.gettempdir(), f"p_s{i}_f{middle_frame_idx}_c{j}.jpg")
+                                cv2.imwrite(crop_path, crop)
+                                
+                                # Extract ReID features
+                                visual_emb = reid.extract_features(crop_path)
+                                
+                                person_appearances.append({
+                                    "scene_id": i,
+                                    "start": start_frame / info['fps'],
+                                    "end": end_frame / info['fps'],
+                                    "visual_embedding": visual_emb,
+                                    "thumbnail": crop_path
+                                })
+                    
+                    progress_bar.progress((i + 1) / len(scenes_to_process), text=f"Processed scene {i+1}/{len(scenes_to_process)}")
+                
+                cap.release()
 
-                st.success("✨ Analysis complete!")
-
-                # Generate dashboard results
-                st.session_state['tracking_results'] = generate_mock_tracking_data(len(scenes))
+                # Step 5: Multimodal Fusion
+                st.write("🔗 Performing Multimodal Fusion...")
+                if person_appearances:
+                    # Align visuals with speaker segments
+                    aligned_data = fusion.align_audio_visual(person_appearances, speaker_segments)
+                    # Cluster all segments into global identities
+                    final_data = fusion.cluster_identities(aligned_data)
+                    
+                    # Aggregate results for dashboard
+                    dashboard_results = format_literal_results(final_data, len(scenes), info['duration'])
+                    st.session_state['tracking_results'] = dashboard_results
+                    st.success("✨ Literal analysis complete!")
+                else:
+                    st.warning("⚠️ No characters detected in the sampled scenes.")
 
     # ── Results Dashboard ──
     st.markdown("---")
@@ -118,8 +185,8 @@ def render_tracking_tab(alpha, beta):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("🎭 Unique Characters", f"{len(results['characters'])}")
         m2.metric("🎬 Total Scenes", f"{results['total_scenes']}")
-        m3.metric("📈 Avg Face Match", "0.86")
-        m4.metric("🎙️ Voice Confidence", "92%")
+        m3.metric("📊 Processed Segments", f"{results['num_segments']}")
+        m4.metric("🎙️ Voice Diarization", "Enabled" if hf_token else "Mocked")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -131,11 +198,12 @@ def render_tracking_tab(alpha, beta):
         """, unsafe_allow_html=True)
 
         df = pd.DataFrame(results['characters'])
-        st.dataframe(
-            df.drop(columns=['thumbnail']),
-            use_container_width=True,
-            hide_index=True,
-        )
+        if not df.empty:
+            st.dataframe(
+                df.drop(columns=['thumbnail']),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -145,7 +213,7 @@ def render_tracking_tab(alpha, beta):
         with chart_col1:
             st.markdown("""
             <div class="fade-in">
-                <h3>🗺️ Character Appearance Heatmap</h3>
+                <h3>🗺️ Appearance Heatmap</h3>
             </div>
             """, unsafe_allow_html=True)
 
@@ -153,23 +221,18 @@ def render_tracking_tab(alpha, beta):
             char_names = [c['Name'] for c in results['characters']]
             fig = px.imshow(
                 heatmap_data,
-                labels=dict(x="Scene Number", y="Character", color="Presence (s)"),
+                labels=dict(x="Scene (Sampled)", y="Identity", color="Presence"),
                 y=char_names,
                 color_continuous_scale="Viridis",
                 aspect="auto"
             )
-            fig.update_layout(
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                font=dict(color='#94a3b8', family='Inter'),
-                margin=dict(l=10, r=10, t=30, b=10),
-            )
+            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#94a3b8', family='Inter'))
             st.plotly_chart(fig, use_container_width=True)
 
         with chart_col2:
             st.markdown("""
             <div class="fade-in">
-                <h3>⏱️ Multimodal Timeline</h3>
+                <h3>⏱️ Identity Timeline</h3>
             </div>
             """, unsafe_allow_html=True)
 
@@ -179,55 +242,55 @@ def render_tracking_tab(alpha, beta):
                 x_start="Start",
                 x_end="End",
                 y="Character",
-                color="Confidence",
-                color_continuous_scale="Plasma",
+                color="Character",
                 title=""
             )
-            fig_timeline.update_layout(
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(0,0,0,0)',
-                font=dict(color='#94a3b8', family='Inter'),
-                margin=dict(l=10, r=10, t=10, b=10),
-                showlegend=False,
-            )
+            fig_timeline.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='#94a3b8', family='Inter'), showlegend=False)
             st.plotly_chart(fig_timeline, use_container_width=True)
 
-        # ── Export ──
-        st.markdown("<br>", unsafe_allow_html=True)
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Character Intelligence (CSV)",
-            data=csv,
-            file_name='auvisegtra_character_intelligence.csv',
-            mime='text/csv',
-            use_container_width=True
-        )
 
+def format_literal_results(final_data, total_scenes, duration):
+    """Transform literal pipeline data into dashboard format."""
+    unique_ids = sorted(list(set([p['global_identity_id'] for p in final_data])))
+    
+    chars = []
+    heatmap = np.zeros((len(unique_ids), 10)) # Sampled to 10 scene points for heatmap
+    timeline_entries = []
+    
+    import datetime
+    base_time = datetime.datetime(2024, 1, 1)
 
-def generate_mock_tracking_data(num_scenes):
-    """Generate high-quality mock data structure that matches production output."""
-    chars = [
-        {"ID": "ID_001", "Name": "Lead Actor", "Appearances": 12, "Screen Time": "145s", "Voice Match": "92%", "thumbnail": ""},
-        {"ID": "ID_002", "Name": "Supporting Role", "Appearances": 5, "Screen Time": "42s", "Voice Match": "88%", "thumbnail": ""},
-        {"ID": "ID_003", "Name": "Background Actor", "Appearances": 2, "Screen Time": "8s", "Voice Match": "45%", "thumbnail": ""},
-        {"ID": "ID_004", "Name": "Narrator", "Appearances": 1, "Screen Time": "120s", "Voice Match": "98%", "thumbnail": ""},
-    ]
-
-    # Heatmap data (Person ID vs Scene)
-    heatmap = np.random.randint(0, 15, size=(4, max(num_scenes, 1)))
-
-    # Timeline data
-    timeline = pd.DataFrame([
-        {"Character": "Lead Actor", "Start": pd.Timestamp('2024-01-01 00:00:00'), "End": pd.Timestamp('2024-01-01 00:00:10'), "Confidence": 0.95},
-        {"Character": "Lead Actor", "Start": pd.Timestamp('2024-01-01 00:00:25'), "End": pd.Timestamp('2024-01-01 00:01:05'), "Confidence": 0.92},
-        {"Character": "Supporting Role", "Start": pd.Timestamp('2024-01-01 00:00:05'), "End": pd.Timestamp('2024-01-01 00:00:15'), "Confidence": 0.88},
-        {"Character": "Narrator", "Start": pd.Timestamp('2024-01-01 00:00:00'), "End": pd.Timestamp('2024-01-01 00:02:00'), "Confidence": 0.99},
-        {"Character": "Background Actor", "Start": pd.Timestamp('2024-01-01 00:01:45'), "End": pd.Timestamp('2024-01-01 00:01:55'), "Confidence": 0.45}
-    ])
+    for i, idx in enumerate(unique_ids):
+        segments = [p for p in final_data if p['global_identity_id'] == idx]
+        scr_time = sum([p['end'] - p['start'] for p in segments])
+        
+        chars.append({
+            "ID": f"CHAR_{idx:03d}",
+            "Name": f"Character {idx}",
+            "Appearances": len(segments),
+            "Screen Time": f"{scr_time:.1f}s",
+            "Matched Speaker": segments[0].get('matched_speaker', 'None'),
+            "thumbnail": segments[0]['thumbnail']
+        })
+        
+        for seg in segments:
+            # Fill heatmap
+            scene_idx = seg['scene_id']
+            if scene_idx < 10:
+                heatmap[i, scene_idx] = 1
+                
+            # Fill timeline
+            timeline_entries.append({
+                "Character": f"Character {idx}",
+                "Start": base_time + datetime.timedelta(seconds=seg['start']),
+                "End": base_time + datetime.timedelta(seconds=seg['end']),
+                "Confidence": 0.9 # Placeholder for cluster confidence
+            })
 
     return {
         "characters": chars,
-        "total_scenes": num_scenes,
+        "total_scenes": total_scenes,
+        "num_segments": len(final_data),
         "heatmap": heatmap,
-        "timeline": timeline
+        "timeline": pd.DataFrame(timeline_entries) if timeline_entries else pd.DataFrame(columns=["Character", "Start", "End"])
     }
